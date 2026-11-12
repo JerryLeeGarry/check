@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# Ubuntu 24.04 host overview. Optional tools never block the remaining checks.
+set -u
+export LC_ALL=C
+
+usage() {
+    printf '用法：check [主机别名]\n  check            检查本机\n  check my-server  通过 SSH 检查远程主机（支持 ~/.ssh/config）\n  check --help     显示帮助\n设置 NO_COLOR=1 可关闭颜色。\n'
+}
+
+init_colors() {
+    RED='' YELLOW='' GREEN='' CYAN='' RESET=''
+    if [[ ${CHECK_COLOR:-auto} == always || ( -t 1 && ${TERM:-dumb} != dumb ) ]]; then
+        if [[ ! ${NO_COLOR+x} ]]; then
+            RED=$'\033[31m' YELLOW=$'\033[33m' GREEN=$'\033[32m'
+            CYAN=$'\033[1;36m' RESET=$'\033[0m'
+        fi
+    fi
+}
+
+heading() { printf '\n%s%s%s\n' "$CYAN" "$1" "$RESET"; }
+percent() { awk -v used="$1" -v total="$2" 'BEGIN { printf "%.1f", (total > 0 ? used / total * 100 : 0) }'; }
+human_bytes() {
+    awk -v n="$1" 'BEGIN { split("B KiB MiB GiB TiB PiB", u, " "); i=1; while(n>=1024 && i<6){n/=1024;i++} printf "%.2f %s", n, u[i] }'
+}
+# Compare the original values so rounding never changes a threshold decision.
+usage_color() {
+    awk -v used="$1" -v total="$2" -v red="$RED" -v yellow="$YELLOW" -v green="$GREEN" \
+        'BEGIN { p=total>0 ? used/total*100 : 0; printf "%s", (p>90 ? red : (p>80 ? yellow : green)) }'
+}
+show_usage() {
+    local label=$1 used=$2 total=$3 color
+    color=$(usage_color "$used" "$total")
+    printf '  %s：%s%s / %s（%s%%）%s\n' "$label" "$color" \
+        "$(human_bytes "$used")" "$(human_bytes "$total")" "$(percent "$used" "$total")" "$RESET"
+}
+
+public_ip() {
+    local value='' endpoint
+    # Try each provider in order, allowing at most three seconds per request.
+    if command -v curl >/dev/null 2>&1; then
+        for endpoint in ifconfig.me ip.sb api.ipify.org; do
+            value=$(curl -s -m 3 "$endpoint" 2>/dev/null) || continue
+            if [[ $value =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || ( $value == *:* && $value =~ ^[0-9a-fA-F:]+$ ) ]]; then
+                printf '%s' "$value"
+                return
+            fi
+        done
+    fi
+    printf '未知'
+}
+
+show_system() {
+    local PRETTY_NAME='未知系统' uptime_seconds days hours minutes
+    [[ ! -r /etc/os-release ]] || . /etc/os-release
+    read -r uptime_seconds _ < /proc/uptime
+    uptime_seconds=${uptime_seconds%%.*}
+    days=$((uptime_seconds / 86400))
+    hours=$((uptime_seconds % 86400 / 3600))
+    minutes=$((uptime_seconds % 3600 / 60))
+    heading '主机信息'
+    printf '  主机名：%s\n  公网 IP：%s\n  系统：%s\n  开机时长：%s 天 %s 小时 %s 分钟\n' \
+        "$(hostname)" "$(public_ip)" "$PRETTY_NAME" "$days" "$hours" "$minutes"
+}
+
+show_cpu() {
+    local cores one five fifteen load color label
+    cores=$(nproc)
+    read -r one five fifteen _ < /proc/loadavg
+    heading 'CPU 与负载'
+    printf '  CPU 核数：%s\n  负载（超过 CPU 核数标红）：' "$cores"
+    for label in '1 分钟' '5 分钟' '15 分钟'; do
+        case $label in '1 分钟') load=$one ;; '5 分钟') load=$five ;; *) load=$fifteen ;; esac
+        color=$(awk -v l="$load" -v c="$cores" -v red="$RED" -v green="$GREEN" 'BEGIN { printf "%s", (l>c ? red : green) }')
+        printf ' %s %s%s%s' "$label" "$color" "$load" "$RESET"
+    done
+    printf '\n'
+}
+
+show_memory() {
+    local total available swap_total swap_free used
+    read -r total available swap_total swap_free < <(
+        awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} /^SwapTotal:/ {s=$2} /^SwapFree:/ {f=$2}
+             END {printf "%.0f %.0f %.0f %.0f\n", t*1024,a*1024,s*1024,f*1024}' /proc/meminfo
+    )
+    heading '内存与 Swap'
+    used=$((total - available))
+    show_usage '内存' "$used" "$total"
+    if (( swap_total == 0 )); then
+        printf '  Swap：0 B / 0 B（0.0%%，未启用）\n'
+    else
+        show_usage 'Swap' "$((swap_total - swap_free))" "$swap_total"
+    fi
+}
+
+show_disk() {
+    local total used available color ratio
+    heading '根分区硬盘'
+    if read -r total used available < <(df -B1 --output=size,used,avail / 2>/dev/null | awk 'NR==2 {print $1,$2,$3}') && [[ $total =~ ^[0-9]+$ && $used =~ ^[0-9]+$ && $available =~ ^[0-9]+$ ]]; then
+        # Match df semantics: reserved blocks are not available to ordinary users.
+        ratio=$((used + available))
+        color=$(usage_color "$used" "$ratio")
+        printf '  /：%s%s / %s（%s%%）%s\n' "$color" "$(human_bytes "$used")" \
+            "$(human_bytes "$total")" "$(percent "$used" "$ratio")" "$RESET"
+    else
+        printf '  无法读取根分区用量\n'
+    fi
+}
+
+show_network() {
+    local line iface='' month rx tx total
+    local quota=1500000000000
+    local -a fields args=()
+    heading '本月网卡流量'
+    if ! command -v vnstat >/dev/null 2>&1; then
+        printf '  未安装 vnstat。安装并启用统计：\n    sudo apt update && sudo apt install -y vnstat\n    sudo systemctl enable --now vnstat\n  安装前的历史流量无法补算。\n'
+        return
+    fi
+    if command -v ip >/dev/null 2>&1; then
+        iface=$(ip -o route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1);exit}}')
+    fi
+    [[ -z $iface ]] || args=(-i "$iface")
+    if ! line=$(vnstat "${args[@]}" --oneline b 2>/dev/null); then
+        printf '  无法读取 vnstat 数据%s；请检查 vnstat 服务及网卡数据库。\n' "${iface:+（$iface）}"
+        printf '  可用 sudo vnstat --add -i <网卡名> 添加网卡，再启用 sudo systemctl enable --now vnstat。\n'
+        return
+    fi
+    IFS=';' read -r -a fields <<< "$line"
+    if (( ${#fields[@]} != 15 )) || [[ ${fields[0]} != 1 && ${fields[0]} != 2 ]] || \
+       [[ ! ${fields[8]} =~ ^[0-9]+$ || ! ${fields[9]} =~ ^[0-9]+$ || ! ${fields[10]} =~ ^[0-9]+$ ]]; then
+        printf '  vnstat 数据为空或格式不支持，请检查服务及数据库。\n'
+        return
+    fi
+    iface=${fields[1]} month=${fields[7]} rx=${fields[8]} tx=${fields[9]} total=${fields[10]}
+    printf '  网卡：%s（默认出口；无默认路由时使用 vnstat 默认网卡）\n  统计月份：%s\n' "$iface" "$month"
+    printf '  接收：%s  发送：%s\n' "$(human_bytes "$rx")" "$(human_bytes "$tx")"
+    show_usage '累计 / 每月额度' "$total" "$quota"
+    printf '  额度：1.5 TB = 1,500,000,000,000 字节；累计为接收 + 发送。\n'
+}
+
+show_sessions_and_processes() {
+    local sessions
+    heading '正在运行的 tmux 会话'
+    if ! command -v tmux >/dev/null 2>&1; then
+        printf '  未安装 tmux（可用 sudo apt install tmux 安装）\n'
+    elif sessions=$(tmux list-sessions -F '#{session_name}：#{session_windows} 个窗口，#{?session_attached,已连接,未连接}' 2>/dev/null); then
+        printf '%s\n' "$sessions" | sed 's/^/  /'
+    else
+        printf '  当前用户无可访问的 tmux 会话（或 tmux 服务不可用）\n'
+    fi
+    heading '占内存最多的 5 个进程（按 RSS 排序）'
+    printf '  %-8s %-16s %10s %8s %s\n' 'PID' '用户' 'RSS(MiB)' '内存%' '进程名'
+    ps -eo pid=,user=,rss=,pmem=,comm= --sort=-rss | \
+        awk 'NR<=5 {printf "  %-8s %-16s %10.1f %8s %s\n", $1,$2,$3/1024,$4,$5}'
+}
+
+main() {
+    local color=auto
+    if (( $# > 1 )); then usage >&2; return 2; fi
+    case ${1:-} in
+        -h|--help) usage; return 0 ;;
+        -*) printf '错误：不支持的参数 %s\n' "$1" >&2; usage >&2; return 2 ;;
+    esac
+    if (( $# == 1 )); then
+        # SSH destinations are data, never interpolated into a remote command.
+        if [[ ! $1 =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.:@%+-]*$ ]]; then
+            printf '错误：主机别名包含不支持的字符。请使用 ~/.ssh/config 中的别名。\n' >&2
+            return 2
+        fi
+        if ! command -v ssh >/dev/null 2>&1; then
+            printf '错误：未安装 ssh，请运行 sudo apt install openssh-client。\n' >&2
+            return 127
+        fi
+        [[ ! -t 1 || ${TERM:-dumb} == dumb ]] || color=always
+        [[ ! ${NO_COLOR+x} ]] || color=never
+        # No PTY: stdin carries this script. SSH can still prompt via /dev/tty.
+        ssh -T -o ConnectTimeout=10 -- "$1" "CHECK_COLOR=$color bash -s" < "${BASH_SOURCE[0]}"
+        return $?
+    fi
+    init_colors
+    show_system
+    show_cpu
+    show_memory
+    show_disk
+    show_network
+    show_sessions_and_processes
+    printf '\n'
+}
+
+if [[ ${BASH_SOURCE[0]:-$0} == "$0" ]]; then
+    main "$@"
+fi
