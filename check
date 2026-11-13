@@ -106,9 +106,45 @@ show_disk() {
     fi
 }
 
+# Read data only: configuration is never sourced as shell code.
+quota_entry() {
+    awk -F= -v host="$1" '
+        { sub(/#.*/, ""); for(i=1;i<=NF;i++) gsub(/^[[:space:]]+|[[:space:]]+$/, "", $i) }
+        NF >= 2 && $1 == host { value = (NF == 2 && $2 != "" ? $2 : "invalid"); found=1 }
+        END { if(found) print value }
+    '
+}
+
+traffic_quota() {
+    local host config candidate quota=1.5 source
+    host=$(hostname)
+    [[ $host != VM-0-5-ubuntu ]] || quota=1
+    config=${CHECK_CONFIG_FILE:-${XDG_CONFIG_HOME:-${HOME:-}/.config}/check/traffic-quotas.conf}
+    for source in file environment; do
+        candidate=''
+        if [[ $source == file ]]; then
+            if [[ -f $config && -r $config ]]; then
+                candidate=$(quota_entry "$host" < "$config")
+            elif [[ -e $config || -n ${CHECK_CONFIG_FILE:-} ]]; then
+                printf '警告：无法读取流量额度配置 %s，保留已有额度。\n' "$config" >&2
+            fi
+        else
+            candidate=$(quota_entry "$host" <<< "${CHECK_TRAFFIC_QUOTAS:-}")
+        fi
+        [[ -n $candidate ]] || continue
+        if [[ $candidate =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+           awk -v n="$candidate" 'BEGIN { exit !(n*1000000000000 >= 1 && n <= 1000000) }'; then
+            quota=$candidate
+        else
+            printf '警告：主机 %s 的流量额度无效（%s），保留已有额度。\n' "$host" "$source" >&2
+        fi
+    done
+    awk -v n="$quota" 'BEGIN { printf "%.0f", n*1000000000000 }'
+}
+
 show_network() {
     local line iface='' month rx tx total
-    local quota=1500000000000
+    local quota
     local -a fields args=()
     heading '本月网卡流量'
     if ! command -v vnstat >/dev/null 2>&1; then
@@ -131,10 +167,12 @@ show_network() {
         return
     fi
     iface=${fields[1]} month=${fields[7]} rx=${fields[8]} tx=${fields[9]} total=${fields[10]}
+    quota=$(traffic_quota)
     printf '  网卡：%s（默认出口；无默认路由时使用 vnstat 默认网卡）\n  统计月份：%s\n' "$iface" "$month"
     printf '  接收：%s  发送：%s\n' "$(human_bytes "$rx")" "$(human_bytes "$tx")"
     show_usage '累计 / 每月额度' "$total" "$quota"
-    printf '  额度：1.5 TB = 1,500,000,000,000 字节；累计为接收 + 发送。\n'
+    printf '  额度：%s TB = %s 字节；累计为接收 + 发送。\n' \
+        "$(awk -v n="$quota" 'BEGIN { printf "%g", n/1000000000000 }')" "$quota"
 }
 
 show_sessions_and_processes() {

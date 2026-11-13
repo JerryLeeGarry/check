@@ -16,6 +16,10 @@ class CheckTests(unittest.TestCase):
         self.env = dict(os.environ, PATH=f'{self.bin}:/usr/bin:/bin', TERM='xterm')
         self.env.pop('NO_COLOR', None)
         self.env.pop('CHECK_COLOR', None)
+        self.env.pop('CHECK_TRAFFIC_QUOTAS', None)
+        self.env.pop('CHECK_CONFIG_FILE', None)
+        self.env['XDG_CONFIG_HOME'] = str(self.bin / 'config')
+        self.mock('hostname', "printf 'silicon-valley\\n'")
         self.mock('curl', "printf '203.0.113.7'")
         self.mock('ip', "printf 'default via 192.0.2.1 dev eth0\\n'")
         self.mock('vnstat', 'exit 1')
@@ -91,6 +95,52 @@ printf '1;eth0;2026-11-12;1;2;3;0;2026-11;600000000000;150000000000;750000000000
         self.mock('vnstat', "printf 'invalid;data\\n'")
         self.assertIn('格式不支持', self.run_check().stdout)
 
+    def test_host_quota_defaults(self):
+        self.assertEqual(self.function('traffic_quota'), '1500000000000')
+        self.mock('hostname', "printf 'VM-0-5-ubuntu\\n'")
+        self.assertEqual(self.function('traffic_quota'), '1000000000000')
+
+    def test_quota_file_and_environment_precedence(self):
+        config = Path(self.env['XDG_CONFIG_HOME']) / 'check/traffic-quotas.conf'
+        config.parent.mkdir(parents=True)
+        config.write_text('# TB quotas\nother-host=9\nsilicon-valley = 2.5 # comment\n')
+        self.assertEqual(self.function('traffic_quota'), '2500000000000')
+        self.env['CHECK_TRAFFIC_QUOTAS'] = 'other-host=8\nsilicon-valley=3.25'
+        self.assertEqual(self.function('traffic_quota'), '3250000000000')
+        self.env['CHECK_TRAFFIC_QUOTAS'] = 'other-host=8'
+        self.assertEqual(self.function('traffic_quota'), '2500000000000')
+        custom = self.bin / 'custom.conf'
+        custom.write_text('silicon-valley=4\nsilicon-valley=5\n')
+        self.env['CHECK_CONFIG_FILE'] = str(custom)
+        self.assertEqual(self.function('traffic_quota'), '5000000000000')
+
+    def test_invalid_quota_keeps_previous_value(self):
+        config = self.bin / 'quotas.conf'
+        config.write_text('silicon-valley=2\n')
+        self.env['CHECK_CONFIG_FILE'] = str(config)
+        for invalid in ['0', '-1', 'abc', '', '1=2', '1e3', '1000001',
+                        '0.0000000000001', f'$(touch {self.bin / "sentinel"})']:
+            with self.subTest(invalid=invalid):
+                self.env['CHECK_TRAFFIC_QUOTAS'] = f'silicon-valley={invalid}'
+                result = subprocess.run(
+                    ['bash', '-c', 'source "$1"; traffic_quota', 'test', str(CHECK)],
+                    env=self.env, text=True, capture_output=True, check=True)
+                self.assertEqual(result.stdout, '2000000000000')
+                self.assertIn('额度无效', result.stderr)
+                self.assertFalse((self.bin / 'sentinel').exists())
+        config.write_text('silicon-valley=invalid\n')
+        self.env.pop('CHECK_TRAFFIC_QUOTAS')
+        self.assertEqual(self.function('traffic_quota'), '1500000000000')
+
+    def test_shanghai_quota_display_and_color(self):
+        self.mock('hostname', "printf 'VM-0-5-ubuntu\\n'")
+        self.mock('vnstat', "printf '1;eth0;2026-11-12;1;2;3;0;2026-11;800000000000;110000000000;910000000000;0;1;2;3\\n'")
+        self.env['CHECK_COLOR'] = 'always'
+        result = self.run_check()
+        self.assertIn('额度：1 TB = 1000000000000 字节', result.stdout)
+        self.assertIn('（91.0%）', result.stdout)
+        self.assertIn('累计 / 每月额度：\x1b[31m', result.stdout)
+
     def test_missing_optional_tools(self):
         # Source just the optional sections with an isolated PATH.
         (self.bin / 'vnstat').unlink()
@@ -117,6 +167,22 @@ bash -s''')
         result = self.run_check('production')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn('\x1b', result.stdout)
+
+    def test_remote_uses_target_hostname_and_configuration(self):
+        self.env['CHECK_TRAFFIC_QUOTAS'] = 'silicon-valley=9'
+        config = self.bin / 'remote.conf'
+        config.write_text('VM-0-5-ubuntu=2\n')
+        self.env['REMOTE_CONFIG'] = str(config)
+        self.mock('vnstat', "printf '1;eth0;2026-11-12;1;2;3;0;2026-11;600000000000;150000000000;750000000000;0;1;2;3\\n'")
+        self.mock('ssh', '''export CHECK_CONFIG_FILE="$REMOTE_CONFIG"
+unset CHECK_TRAFFIC_QUOTAS
+hostname() { printf 'VM-0-5-ubuntu\\n'; }
+export -f hostname
+bash -s''')
+        result = self.run_check('production')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('额度：2 TB = 2000000000000 字节', result.stdout)
+        self.assertIn('（37.5%）', result.stdout)
 
     def test_color_output(self):
         self.env['CHECK_COLOR'] = 'always'
